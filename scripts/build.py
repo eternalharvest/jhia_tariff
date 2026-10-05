@@ -174,29 +174,91 @@ def find_amount_cols(ws, hdr: int, grade_col: int) -> tuple[int, int, int]:
 
 
 def find_pair_row(ws, hdr: int) -> tuple:
-    """「全額」「折半額」の見出しが並ぶ行を、hdr の直後数行の窓から探して返す。
-    固定の相対位置(hdr + 1)に決め打ちせず、間に行が増えてもテキストで追従する。"""
+    """「全額」と、それに対応する「折半額」または「被保険者負担」の見出しが並ぶ行を、
+    hdr の直後数行の窓から探して返す。固定の相対位置(hdr + 1)に決め打ちせず、
+    間に行が増えてもテキストで追従する。"""
     for offset in range(1, 4):
         row = row_values(ws, hdr + offset)
-        if find_col(row, "全額") is not None and find_col(row, "折半額") is not None:
+        if find_col(row, "全額") is not None and (
+            find_col(row, "折半額") is not None or find_col(row, "被保険者負担") is not None
+        ):
             return row
-    raise ValueError("「全額」「折半額」の見出し行が見つかりません")
+    raise ValueError("「全額」の見出し行が見つかりません")
+
+
+def scan_amount_groups(row: tuple) -> list[dict]:
+    """「全額」から始まる金額の列組を、左から順に検出する。
+
+    旧レイアウト: 全額・折半額 の2列組(health_col=None)。
+    新レイアウト(令和8年10月分〜の「保険料調整制度」): 全額・被保険者負担
+    [・保険料調整額] の2〜3列組(health_col=None, employee_col, adjustment_col)。
+    ブロック数も列幅もレイアウトによって異なるため、都度その場で判定する。"""
+    groups = []
+    i, n = 0, len(row)
+    while i < n:
+        if strip_ws(row[i]) != "全額":
+            i += 1
+            continue
+        nxt = strip_ws(row[i + 1]) if i + 1 < n else None
+        if nxt == "折半額":
+            groups.append({"total_col": i, "half_col": i + 1, "employee_col": None, "adjustment_col": None})
+            i += 2
+        elif nxt == "被保険者負担":
+            adj = i + 2 if i + 2 < n and strip_ws(row[i + 2]) == "保険料調整額" else None
+            groups.append({"total_col": i, "half_col": None, "employee_col": i + 1, "adjustment_col": adj})
+            i += 3 if adj is not None else 2
+        else:
+            raise ValueError(f"「全額」(列{i})の次に「折半額」も「被保険者負担」もありません")
+    return groups
+
+
+def amount_pair(row: tuple, group: dict) -> tuple:
+    """1つの金額グループから (全額, 被保険者が実際に払う額, 調整額) を取り出す。
+
+    旧レイアウト(全額/折半額)では調整額は常に None。新レイアウト(全額/被保険者負担
+    [/保険料調整額])でも、調整制度の対象外の等級では被保険者負担欄が空になるため、
+    その場合は従来通り全額の半分を実際の負担額として補う(実額を優先する設計)。"""
+    total = row[group["total_col"]]
+    if group["half_col"] is not None:
+        return total, row[group["half_col"]], None
+    employee = row[group["employee_col"]]
+    if employee is None:
+        half = total / 2 if isinstance(total, (int, float)) else None
+        return total, half, None
+    adjustment = row[group["adjustment_col"]] if group["adjustment_col"] is not None else None
+    return total, employee, adjustment
+
+
+def add_or_none(a, b):
+    return None if a is None or b is None else a + b
 
 
 def classify_amount_block(ws, hdr: int, col: int) -> str | None:
-    """全額/折半額の列が、ヘッダー上段のどのブロック(health/health_ltc/
-    childcare_levy/pension)に属するかを、その列の見出しテキストから判別する。"""
+    """金額グループが、ヘッダー上段のどのブロック(health/health_ltc/care/
+    childcare_levy/pension)に属するかを、その列の見出しテキストから判別する。
+    health_ltc は旧レイアウトの「健康保険料・介護保険料」合算ブロック、care は
+    新レイアウトで分離された「介護保険料」単独ブロック。"""
     sub = row_values(ws, hdr - 1)[col] if hdr - 1 >= 1 else None
     title = row_values(ws, hdr - 2)[col] if hdr - 2 >= 1 else None
-    text = f"{sub or ''}{title or ''}"
-    if "該当しない" in text:
+    sub_text = sub or ""
+    # 旧レイアウトでは、sub行(hdr-1)だけが「該当しない/該当する」を持ち、
+    # title行(hdr-2)は health/health_ltc の両列にまたがる共通の見出し
+    # (「...健康保険料・介護保険料」)なので当てにできない。また新レイアウトの
+    # 「介護保険料」ブロックの title には「...に該当する場合のみ」という説明文が
+    # 含まれるため、sub行単体で先に判定しないと誤判定する。
+    if "該当しない" in sub_text:
         return "health"
-    if "該当する" in text:
+    if "該当する" in sub_text:
         return "health_ltc"
+    text = f"{sub_text}{title or ''}"
+    if "介護保険料" in text:
+        return "care"
     if "子ども" in text:
         return "childcare_levy"
     if "厚生年金" in text or "坑内員" in text or "一般" in text:
         return "pension"
+    if "健康保険料" in text:
+        return "health"
     return None
 
 
@@ -236,29 +298,38 @@ def parse_general(wb) -> list[dict]:
             raise ValueError(f"シート {sn!r}: 支部ラベル {label!r} が想定 {name!r} と不一致")
         std_col, min_col, max_col = find_amount_cols(ws, hdr, grade_col)
 
-        # 「全額」「折半額」ヘッダーの列を左から順に拾い、同じ順序で対になっていると
-        # みなす(年度によってブロック数(3 or 4)が違うため、個数を決め打ちしない)。
+        # 「全額」から始まる列組を左から順に拾う(年度によってブロック数や、
+        # 全額/折半額 2列組か 全額/被保険者負担[/調整額] 2〜3列組かが違うため、
+        # 個数・幅を決め打ちしない)。
         pair_row = find_pair_row(ws, hdr)
-        total_cols = [i for i, c in enumerate(pair_row) if strip_ws(c) == "全額"]
-        half_cols = [i for i, c in enumerate(pair_row) if strip_ws(c) == "折半額"]
-        if len(total_cols) != len(half_cols):
-            raise ValueError(f"シート {sn!r}: 「全額」({len(total_cols)})と「折半額」({len(half_cols)})の列数が不一致")
+        groups = scan_amount_groups(pair_row)
 
-        blocks: dict[str, tuple[int, int]] = {}
-        for tcol, hcol in zip(total_cols, half_cols):
-            block = classify_amount_block(ws, hdr, tcol)
+        blocks: dict[str, dict] = {}
+        for group in groups:
+            block = classify_amount_block(ws, hdr, group["total_col"])
             if block is None:
-                raise ValueError(f"シート {sn!r}: {tcol} 列目の金額ブロック(健康保険/介護/支援金/年金)を判別できません")
+                raise ValueError(f"シート {sn!r}: {group['total_col']} 列目の金額ブロック"
+                                  f"(健康保険/介護/支援金/年金)を判別できません")
             if block in blocks:
                 raise ValueError(f"シート {sn!r}: 金額ブロック {block!r} が複数見つかりました")
-            blocks[block] = (tcol, hcol)
+            blocks[block] = group
 
-        missing = {"health", "health_ltc", "pension"} - set(blocks)
-        if missing:
+        # 介護保険料は、旧レイアウトでは「健康保険料・介護保険料」として合算された
+        # 1つの列組(health_ltc)だが、令和8年10月分〜の新レイアウト(保険料調整制度)
+        # では「健康保険料」(health)と「介護保険料」(care)に分離されている。
+        # どちらか一方が揃っていれば十分とする。
+        has_combined_ltc = "health_ltc" in blocks
+        has_split_care = "health" in blocks and "care" in blocks
+        missing = {"health", "pension"} - set(blocks)
+        if missing or not (has_combined_ltc or has_split_care):
+            if not (has_combined_ltc or has_split_care):
+                missing = missing | {"health_ltc(またはhealth+care)"}
             raise ValueError(f"シート {sn!r}: 必須の金額ブロックが見つかりません: {missing}")
 
         hdr_row = row_values(ws, hdr)
-        rates = {block: num(hdr_row[tcol]) for block, (tcol, _) in blocks.items()}
+        rates = {block: num(hdr_row[group["total_col"]]) for block, group in blocks.items()}
+        rate_health_ltc = rates["health_ltc"] if has_combined_ltc else \
+            num((rates.get("health") or 0) + (rates.get("care") or 0))
 
         for row in ws.iter_rows(min_row=hdr + 1, values_only=True):
             g = row[grade_col]
@@ -268,14 +339,20 @@ def parse_general(wb) -> list[dict]:
 
             def amount(block):
                 if block not in blocks:
-                    return None, None
-                tcol, hcol = blocks[block]
-                return row[tcol], row[hcol]
+                    return None, None, None
+                return amount_pair(row, blocks[block])
 
-            health_full, health_half = amount("health")
-            health_ltc_full, health_ltc_half = amount("health_ltc")
-            childcare_levy_full, childcare_levy_half = amount("childcare_levy")
-            pension_full, pension_half = amount("pension")
+            health_full, health_half, health_adjustment = amount("health")
+            childcare_levy_full, childcare_levy_half, _ = amount("childcare_levy")
+            pension_full, pension_half, pension_adjustment = amount("pension")
+
+            if has_combined_ltc:
+                health_ltc_full, health_ltc_half, _ = amount("health_ltc")
+            else:
+                care_full, care_half, _ = amount("care")
+                health_ltc_full = add_or_none(health_full, care_full)
+                health_ltc_half = add_or_none(health_half, care_half)
+
             out.append({
                 "prefecture_code": code,
                 "prefecture_name": name,
@@ -285,17 +362,19 @@ def parse_general(wb) -> list[dict]:
                 "remuneration_min": num(row[min_col]),
                 "remuneration_max": num(row[max_col]),
                 "rate_health": rates.get("health"),
-                "rate_health_ltc": rates.get("health_ltc"),
+                "rate_health_ltc": rate_health_ltc,
                 "rate_childcare_levy": rates.get("childcare_levy"),
                 "rate_pension": rates.get("pension"),
                 "health_full": money(health_full),
                 "health_half": money(health_half),
+                "health_adjustment": money(health_adjustment),
                 "health_ltc_full": money(health_ltc_full),
                 "health_ltc_half": money(health_ltc_half),
                 "childcare_levy_full": money(childcare_levy_full),
                 "childcare_levy_half": money(childcare_levy_half),
                 "pension_full": money(pension_full),
                 "pension_half": money(pension_half),
+                "pension_adjustment": money(pension_adjustment),
             })
     return out
 
@@ -355,13 +434,15 @@ JA_KEYS = {
         "rate_childcare_levy": "子ども・子育て支援金率",
         "rate_pension": "厚生年金保険料率",
         "health_full": "健康保険料(全額)",
-        "health_half": "健康保険料(折半額)",
+        "health_half": "健康保険料(被保険者負担額)",
+        "health_adjustment": "健康保険料(調整額)",
         "health_ltc_full": "健康保険料・介護あり(全額)",
-        "health_ltc_half": "健康保険料・介護あり(折半額)",
+        "health_ltc_half": "健康保険料・介護あり(被保険者負担額)",
         "childcare_levy_full": "子ども・子育て支援金(全額)",
-        "childcare_levy_half": "子ども・子育て支援金(折半額)",
+        "childcare_levy_half": "子ども・子育て支援金(被保険者負担額)",
         "pension_full": "厚生年金保険料(全額)",
-        "pension_half": "厚生年金保険料(折半額)",
+        "pension_half": "厚生年金保険料(被保険者負担額)",
+        "pension_adjustment": "厚生年金保険料(調整額)",
     },
     "optional": {
         "prefecture_code": "都道府県コード",
