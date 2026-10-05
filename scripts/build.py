@@ -5,12 +5,19 @@
     python scripts/build.py [--year r08|all] [--out site] [--cache .cache]
     --year 省略時は最新年度のみ、'all' で変換可能な全年度を処理する。
 
-出力 (--out) は年度ディレクトリごと:
-    {year}/general.json   一般の被保険者 (健康保険・介護・子ども子育て支援金・厚生年金)
-    {year}/optional.json  任意継続被保険者
-    {year}/index.json     メタ情報 (取得元 URL, 生成時刻, 件数)
-    latest/               最新年度 ({year}/ の内容と同一) のコピー
-    index.json            変換できた年度一覧・最新年度
+年度内に保険料率の改定が複数回あった場合(例: r01, r02)は、改定ごとに
+サブディレクトリを分けて出力する。改定のサブページ番号は年度によって新しい順/
+古い順が不統一なため、「最新」は各改定の実施時期(表に書かれた「○年○月分」)で
+判定している。
+
+出力 (--out):
+    {year}/{revision}/general.json   一般の被保険者 (健康保険・介護・子ども子育て支援金・厚生年金)
+    {year}/{revision}/optional.json  任意継続被保険者
+    {year}/{revision}/index.json     メタ情報 (取得元 URL, 生成時刻, 実施時期, 件数)
+    {year}/latest/                   その年度で最新の改定 ({year}/{revision}/ と同一) のコピー
+    {year}/index.json                その年度の改定一覧・最新の改定
+    latest/                          全体で最新の年度・改定のコピー
+    index.json                       変換できた年度一覧・最新年度
 """
 from __future__ import annotations
 
@@ -193,13 +200,31 @@ def classify_amount_block(ws, hdr: int, col: int) -> str | None:
     return None
 
 
-def effective_text(ws) -> str:
+ERA_BASE = {"令和": 2019, "平成": 1989, "昭和": 1926}
+
+
+def effective_key(wb) -> tuple[int, int]:
+    """表の先頭にある「令和〇年〇月分」のような実施時期を西暦の (年, 月) に変換して返す。
+    同じ年度でも改定のサブページ番号は昇順/降順が年度によって不統一(実際に r01 は
+    古い順、r02 は新しい順だった)なので、どれが最新の改定かはこの実施時期で判定する。"""
+    ws = wb[wb.sheetnames[0]]
     for row in ws.iter_rows(min_row=1, max_row=4, values_only=True):
         for c in row:
-            if isinstance(c, str) and ("分" in c) and ("令和" in c or "平成" in c) and "から" in c or \
-               isinstance(c, str) and re.match(r"^[（(]令和.*分.*[）)]$", c.strip()):
-                return c.strip()
-    return ""
+            if isinstance(c, str):
+                m = re.search(r"(令和|平成|昭和)(元|\d+)年\s*(\d{1,2})月分", c)
+                if m:
+                    era, yr, month = m.group(1), m.group(2), int(m.group(3))
+                    year = ERA_BASE[era] + (0 if yr == "元" else int(yr) - 1)
+                    return year, month
+    raise ValueError("実施時期(「○年○月分」)が見つかりません")
+
+
+def now_month() -> tuple[int, int]:
+    """現在の (年, 月) を JST で返す。実施時期が未来の改定(協会けんぽが先行して
+    公開しているもの)を「最新」として latest/ に反映しないよう、この値との
+    比較に使う。"""
+    now = datetime.now(JST)
+    return now.year, now.month
 
 
 def parse_general(wb) -> list[dict]:
@@ -377,28 +402,30 @@ def validate(kind: str, rows: list[dict]) -> None:
         raise ValueError(f"{kind}: 保険料が欠損/非正の行があります")
 
 
-def build_year(year: str, out: Path, cache: Path) -> dict:
-    """1 年度分を取得・変換し、out 直下 (呼び出し側が年度ディレクトリを渡す) に書き出す。"""
-    page = f"{INDEX_URL}{year}"
-    print(f"年度ページ: {page}")
+def find_revision_candidates(page_url: str, year: str) -> list[str]:
+    """改定ごとの候補ページURL一覧を返す。年度ページ自身に直接 .xlsx がある場合は
+    それも1つの候補として含め、さらにその下に改定ごとのサブページ(例: r01/001,
+    r01/002)があれば合わせて返す。"""
+    candidates = []
+    if find_xlsx_links(page_url):
+        candidates.append(page_url)
+    html = fetch(page_url).decode("utf-8", "replace")
+    hrefs = re.findall(r'href="([^"]+)"', html)
+    subpages = sorted({urljoin(page_url, h) for h in hrefs if re.search(rf"/{re.escape(year)}/\d+/?$", h)})
+    for sp in subpages:
+        if sp not in candidates:
+            candidates.append(sp)
+    return candidates
+
+
+def write_revision(out: Path, year: str, rid: str, page: str, found: dict, effective: tuple[int, int]) -> dict:
+    """1 つの改定分(found: kind -> {wb, url})を out 直下に書き出す。found に
+    存在する種類(general/optional)だけを書き出す(片方しか無ければ片方だけ)。"""
     out.mkdir(parents=True, exist_ok=True)
-    cache.mkdir(parents=True, exist_ok=True)
-
-    found: dict[str, dict] = {}
-    for url in find_xlsx_links(page):
-        data = fetch(url)
-        (cache / Path(url).name).write_bytes(data)
-        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
-        kind = classify(wb)
-        print(f"  {url} -> {kind} ({len(wb.sheetnames)} sheets)")
-        if kind and kind not in found:
-            found[kind] = {"wb": wb, "url": url}
-    missing = set(PARSERS) - set(found)
-    if missing:
-        raise SystemExit(f"[{year}] Excel が見つかりません: {missing}")
-
     files = {}
     for kind, parse in PARSERS.items():
+        if kind not in found:
+            continue
         wb = found[kind]["wb"]
         rows = parse(wb)
         validate(kind, rows)
@@ -408,14 +435,18 @@ def build_year(year: str, out: Path, cache: Path) -> dict:
             json.dumps(rows, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
         (out / f"{kind}.ja.json").write_text(
             json.dumps(to_ja(kind, rows), ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        kind_eff = found[kind]["effective"]
         files[kind] = {"file": f"{kind}.json", "file_ja": f"{kind}.ja.json",
-                       "rows": len(rows), "title": title, "source": found[kind]["url"]}
-        print(f"  {kind}.json, {kind}.ja.json: {len(rows)} rows")
+                       "rows": len(rows), "title": title, "source": found[kind]["url"],
+                       "effective_from": f"{kind_eff[0]}-{kind_eff[1]:02d}"}
+        print(f"  [{rid}] {kind}.json, {kind}.ja.json: {len(rows)} rows")
 
     index = {
         "generated_at": datetime.now(JST).isoformat(timespec="seconds"),
-        "year_page": page,
         "year": year,
+        "revision": rid,
+        "revision_page": page,
+        "effective_from": f"{effective[0]}-{effective[1]:02d}",
         "files": files,
     }
     (out / "index.json").write_text(
@@ -423,11 +454,112 @@ def build_year(year: str, out: Path, cache: Path) -> dict:
     return index
 
 
-def copy_as_latest(year_dir: Path, latest_dir: Path) -> None:
-    latest_dir.mkdir(parents=True, exist_ok=True)
+def copy_dir(src: Path, dst: Path) -> None:
+    """src 直下のファイルを dst にコピーする。optional[.ja].json は、その改定で
+    任意継続の Excel がまだ存在しない場合は無いことがあるので、無ければスキップする。"""
+    dst.mkdir(parents=True, exist_ok=True)
     names = ["general.json", "general.ja.json", "optional.json", "optional.ja.json", "index.json"]
     for name in names:
-        (latest_dir / name).write_bytes((year_dir / name).read_bytes())
+        src_file = src / name
+        if src_file.exists():
+            (dst / name).write_bytes(src_file.read_bytes())
+
+
+def build_year(year: str, out: Path, cache: Path) -> dict:
+    """1 年度分(年度内に複数の改定があれば全て)を取得・変換し、年度ディレクトリに書き出す。
+
+    改定のサブページ番号は年度によって新しい順/古い順と不統一(実際に r01 は古い順、
+    r02 は新しい順だった)なので、順序は各改定の実施時期(effective_key)で判定する。
+    また、改定によっては一般(health)だけ新しい Excel が公開され、任意継続
+    (optional)は前の改定のものが変わらず使われる(=そのページには存在しない)
+    ことがあるため、実施時期の古い順に処理しながら「直前までに見つかった
+    ファイル」を引き継ぐ(carry)。任意継続がまだ一度も公開されていない期間は
+    general[.ja].json だけを出力し、optional[.ja].json は無い(片方だけ揃って
+    いれば片方だけ書き出す)。
+    """
+    page = f"{INDEX_URL}{year}"
+    print(f"年度ページ: {page}")
+    out.mkdir(parents=True, exist_ok=True)
+
+    candidates = find_revision_candidates(page, year)
+    if not candidates:
+        candidates = [page]
+
+    loaded = []
+    for cpage in candidates:
+        found: dict[str, dict] = {}
+        for url in find_xlsx_links(cpage):
+            data = fetch(url)
+            cache_dir = cache / Path(url).stem
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / Path(url).name).write_bytes(data)
+            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+            kind = classify(wb)
+            print(f"  {cpage} : {url} -> {kind} ({len(wb.sheetnames)} sheets)")
+            if kind and kind not in found:
+                # 種類ごとに自分自身の実施時期を持たせる。carry-forward で引き継がれた
+                # 場合に、latest/ の optional が実際にいつ更新されたものかを
+                # (この改定自体の effective_from とは別に)追跡できるようにするため。
+                try:
+                    kind_effective = effective_key(wb)
+                except ValueError as e:
+                    print(f"  [警告] {year}: {url} の実施時期が分からずスキップ ({e})", file=sys.stderr)
+                    continue
+                found[kind] = {"wb": wb, "url": url, "effective": kind_effective}
+        if not found:
+            continue
+        effective = (found.get("general") or found.get("optional"))["effective"]
+        loaded.append({"page": cpage, "found": found, "effective": effective})
+
+    if not loaded:
+        raise SystemExit(f"[{year}] Excel が見つかりません。")
+
+    loaded.sort(key=lambda r: r["effective"])  # 実施時期の古い順
+
+    revisions = []
+    carry: dict[str, dict] = {}
+    for rev in loaded:
+        carry = {**carry, **rev["found"]}
+        revisions.append({"page": rev["page"], "effective": rev["effective"], "found": dict(carry)})
+
+    built = []
+    built_effective: dict[str, tuple[int, int]] = {}
+    for i, rev in enumerate(revisions, 1):
+        rid = f"{i:03d}"
+        try:
+            write_revision(out / rid, year, rid, rev["page"], rev["found"], rev["effective"])
+            built.append(rid)
+            built_effective[rid] = rev["effective"]
+        except (Exception, SystemExit) as e:
+            # 1つの改定だけが異常な場合、同じ年度の他の改定は生かしたままにする。
+            # ただし改定が1つしかない年度では、想定通りの失敗としてそのまま止める。
+            if len(revisions) == 1:
+                raise
+            print(f"  [警告] {year}/{rid}: スキップ ({e})", file=sys.stderr)
+            shutil.rmtree(out / rid, ignore_errors=True)
+
+    if not built:
+        raise SystemExit(f"[{year}] どの改定も変換できませんでした。")
+
+    # 協会けんぽは実施時期より前に改定を公開することが多いため、「最新」は単に
+    # 一番新しく見つかった改定ではなく、実施時期(effective_from)が今月以前の
+    # ものの中で一番新しいものとする。まだ実施されていない改定が見つかっている
+    # 場合、それが latest/ に反映されるのは実施時期が来てから。
+    now = now_month()
+    valid = [rid for rid in built if built_effective[rid] <= now]
+    latest_rid = max(valid, key=lambda r: built_effective[r]) if valid else min(built, key=lambda r: built_effective[r])
+    copy_dir(out / latest_rid, out / "latest")
+
+    index = {
+        "generated_at": datetime.now(JST).isoformat(timespec="seconds"),
+        "year_page": page,
+        "year": year,
+        "revisions": built,
+        "latest": latest_rid,
+    }
+    (out / "index.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return index
 
 
 # --------------------------------------------------------------------- main
@@ -451,9 +583,10 @@ def main() -> int:
 
     out, cache = Path(a.out), Path(a.cache)
     built = []
+    year_indexes: dict[str, dict] = {}
     for year in targets:
         try:
-            build_year(year, out / year, cache / year)
+            year_indexes[year] = build_year(year, out / year, cache / year)
             built.append(year)
         except (Exception, SystemExit) as e:
             # 単一年度を明示指定した場合は想定通りの失敗として即座に止める。
@@ -467,13 +600,41 @@ def main() -> int:
     if not built:
         raise SystemExit("どの年度も変換できませんでした。")
 
-    if latest in built:
-        copy_as_latest(out / latest, out / "latest")
+    # 各年度・各改定で実際に生成されたファイルを列挙する。general.json は複数改定が
+    # あっても欠けることはないが、optional.json は改定によって無いことがあるため、
+    # 「optional.json を含む最新の改定はどれか」のようにこの一覧をフィルタして
+    # 適切な改定を選べるようにする。実施時期の古い順に並べる。
+    revisions_manifest = []
+    for year in built:
+        for rid in year_indexes[year]["revisions"]:
+            rev_index = json.loads((out / year / rid / "index.json").read_text(encoding="utf-8"))
+            files = [f for kind_files in rev_index["files"].values()
+                     for f in (kind_files["file"], kind_files["file_ja"])]
+            revisions_manifest.append({
+                "year": year,
+                "revision": rid,
+                "path": f"{year}/{rid}",
+                "effective_from": rev_index["effective_from"],
+                "files": files,
+            })
+    revisions_manifest.sort(key=lambda r: r["effective_from"])
+
+    # 全年度・全改定を通して、年度をまたいだ「実施時期が今月以前で一番新しいもの」
+    # を latest/ に反映する。協会けんぽは実施時期より前に改定を公開することが多く、
+    # 単に一番新しく見つかった年度・改定を使うと、まだ実施されていない将来の改定を
+    # 「最新」として配信してしまうため。
+    now_str = f"{now_month()[0]}-{now_month()[1]:02d}"
+    valid_entries = [r for r in revisions_manifest if r["effective_from"] <= now_str]
+    latest_entry = max(valid_entries, key=lambda r: r["effective_from"]) if valid_entries else \
+        min(revisions_manifest, key=lambda r: r["effective_from"])
+    copy_dir(out / latest_entry["path"], out / "latest")
+    latest_year = latest_entry["year"]
 
     (out / "index.json").write_text(json.dumps({
         "generated_at": datetime.now(JST).isoformat(timespec="seconds"),
         "years": built,
-        "latest": latest if latest in built else None,
+        "latest": latest_year,
+        "revisions": revisions_manifest,
     }, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     return 0
 
