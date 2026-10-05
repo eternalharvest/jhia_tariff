@@ -1,0 +1,44 @@
+name: Build & publish tariff JSON
+
+on:
+  schedule:
+    - cron: "0 21 * * *"   # 毎日 06:00 JST (UTC 21:00)
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --no-install-project
+      - name: Scrape Excel and convert to JSON
+        run: uv run --no-sync python scripts/build.py --year all --out site
+      - name: Add landing page
+        run: cp README.md site/README.md
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
