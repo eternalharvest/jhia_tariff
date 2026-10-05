@@ -3,6 +3,7 @@ name = "jhia-tariff"
 version = "0.1.0"
 description = "協会けんぽの保険料額表 Excel を JSON に変換して公開する"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "openpyxl>=3.1",
